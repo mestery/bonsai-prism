@@ -17,6 +17,7 @@ import gc
 import json
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -356,23 +357,26 @@ class _StreamChunk(BaseModel):
     choices: List[_StreamChoice]
 
 
-app = FastAPI(title="Ternary-Bonsai OpenAI Server")
-
 state: Dict[str, Any] = {
     "model_dir": None, "model": None, "tokenizer": None, "model_name": None
 }
 
 
-@app.on_event("startup")
-def _startup():
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
     model_dir = state["model_dir"]
     print(f"loading model from {model_dir} ...")
     t0 = time.time()
     model, tokenizer = load_model(model_dir)
     state["model"], state["tokenizer"] = model, tokenizer
     state["model_name"] = Path(model_dir).name
-    mx.metal.clear_cache()
+    mx.clear_cache()
     print(f"model loaded in {time.time() - t0:.1f}s")
+    yield
+    mx.clear_cache()
+
+
+app = FastAPI(title="Ternary-Bonsai OpenAI Server", lifespan=_lifespan)
 
 
 def _not_ready() -> None:
@@ -477,16 +481,21 @@ def _stream(messages, max_tokens, temperature, top_p, top_k, model_name):
 # ---------------------------------------------------------------------------
 
 def main():
+    global MAX_CTX
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
                     help="path to the model pack directory")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default=DEFAULT_HOST)
+    ap.add_argument("--max-ctx", type=int, default=MAX_CTX,
+                    help="max prompt context in tokens; longer prompts are "
+                         "front-truncated (default %(default)s)")
     args = ap.parse_args()
 
     state["model_dir"] = args.model
+    MAX_CTX = args.max_ctx
 
-    print(f"serving on http://{args.host}:{args.port}")
+    print(f"serving on http://{args.host}:{args.port} (max_ctx={MAX_CTX})")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
