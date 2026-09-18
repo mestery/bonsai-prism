@@ -88,12 +88,16 @@ def rebuild_packed(model, modules: List[dict], weights: Dict[str, mx.array]) -> 
 
 
 def _count_packed(model) -> int:
-    """Recursively count ``Packed`` submodules (``tree_flatten`` does not recurse
-    into nested modules, so walk the tree explicitly)."""
+    """Recursively count ``Packed`` submodules.
+
+    MLX ``nn.Module`` is a ``Mapping``: its parameters and submodules are stored
+    in the module's mapping (accessible via ``dict(node)`` / ``node.keys()``),
+    NOT in ``__dict__`` (``vars(node)`` only yields ``_no_grad``/``_training``).
+    Walk the mapping so nested modules are reached."""
     total = 0
     def walk(node):
         nonlocal total
-        for v in vars(node).values():
+        for v in dict(node).values():
             if isinstance(v, Packed):
                 total += 1
             elif isinstance(v, nn.Module):
@@ -199,9 +203,23 @@ def sample(logits: mx.array, temperature: float, top_p: float,
     return int(mx.random.categorical(probs))
 
 
-def generate(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
-             max_tokens: int, temperature: float, top_p: float,
-             top_k: Optional[int]) -> Dict[str, Any]:
+def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
+                    max_tokens: int, temperature: float, top_p: float,
+                    top_k: Optional[int]):
+    """Incremental completion generator for a reasoning model.
+
+    Yields one dict per sampled token carrying ``reasoning_delta`` /
+    ``content_delta`` (the newly decoded text for each stream), then a final
+    dict with the full ``reasoning`` / ``content`` strings plus usage and
+    ``finish_reason``.
+
+    The chat template pre-fills the open-think token (id 248068) after the
+    assistant turn start, so generation begins in *reasoning* mode.  We flip to
+    *content* mode when the close-think token (id 248069) is emitted (the
+    separator token itself is dropped).  Each step re-decodes the full
+    accumulated buffer so multi-byte UTF-8 sequences split across tokens
+    reassemble correctly; the delta is the suffix since the previous decode.
+    """
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -216,9 +234,32 @@ def generate(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
     logits = model(x, cache=cache)
     ids = list(input_ids)
     finish = "stop"
+
+    close_id = tokenizer.convert_tokens_to_ids(_THINK_CLOSE)
+    in_reasoning = True
+    reasoning_buf: List[int] = []
+    content_buf: List[int] = []
+    reasoning_text = ""
+    content_text = ""
+
     for _ in range(max_tokens):
         nxt = sample(logits[:, -1, :], temperature, top_p, top_k)
         ids.append(nxt)
+
+        if in_reasoning and nxt == close_id:
+            in_reasoning = False      # separator token dropped
+        elif in_reasoning:
+            reasoning_buf.append(nxt)
+        else:
+            content_buf.append(nxt)
+
+        rt = tokenizer.decode(reasoning_buf, skip_special_tokens=True)
+        ct = tokenizer.decode(content_buf, skip_special_tokens=True)
+        rd = rt[len(reasoning_text):] if rt.startswith(reasoning_text) else rt
+        cd = ct[len(content_text):] if ct.startswith(content_text) else ct
+        reasoning_text, content_text = rt, ct
+        yield {"reasoning_delta": rd, "content_delta": cd}
+
         if nxt == eos:
             finish = "stop"
             break
@@ -226,34 +267,26 @@ def generate(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
     else:
         finish = "length"
 
-    # This is a reasoning model: the chat template pre-fills the open-think
-    # token (id 248068) after the assistant turn start, so the model's
-    # reasoning runs from the end of the prompt until the close-think token
-    # (id 248069), followed by the final answer.  The tokenizer decodes those
-    # two tokens asymmetrically, so split at the token-id level: reasoning =
-    # generated tokens up to and including the close token, content = the rest.
-    tail = ids[len(input_ids):]
-    close_id = tokenizer.convert_tokens_to_ids(_THINK_CLOSE)
-    close_pos = next((i for i, t in enumerate(tail) if t == close_id), None)
-    if close_pos is not None:
-        reasoning_ids = tail[:close_pos]   # token right before the close marker
-        kept = tail[close_pos + 1:]
-    else:
-        reasoning_ids = []
-        kept = tail
-
-    content = tokenizer.decode(kept, skip_special_tokens=True).strip()
-    reasoning = (
-        tokenizer.decode(reasoning_ids, skip_special_tokens=True).strip()
-        or None
-    )
-    return {
+    yield {
+        "reasoning": reasoning_text.strip() or None,
+        "content": content_text.strip(),
+        "finish_reason": finish,
         "prompt_tokens": len(input_ids),
         "completion_tokens": len(ids) - len(input_ids),
-        "content": content,
-        "reasoning": reasoning,
-        "finish_reason": finish,
     }
+
+
+def generate(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
+             max_tokens: int, temperature: float, top_p: float,
+             top_k: Optional[int]) -> Dict[str, Any]:
+    """Non-streaming completion: consume :func:`generate_stream` to completion."""
+    final: Dict[str, Any] = {}
+    for item in generate_stream(
+        model, tokenizer, messages, max_tokens, temperature, top_p, top_k
+    ):
+        if "reasoning_delta" not in item:
+            final = item
+    return final
 
 
 # ---------------------------------------------------------------------------
@@ -399,36 +432,40 @@ def chat_completions(req: ChatCompletionRequest):
 
 
 def _stream(messages, max_tokens, temperature, top_p, top_k, model_name):
-    """Non-incremental 'stream': yields the whole completion as a few SSE chunks.
-
-    True per-token streaming would require reworking the generator to yield
-    incrementally; this returns the completed text in a stream-shaped response
-    so OpenAI `stream=true` clients still work.
-    """
-    res = generate(
-        state["model"], state["tokenizer"], messages,
-        max_tokens, temperature, top_p, top_k,
-    )
+    """Incremental SSE stream: one chunk per sampled token (plus the initial
+    role chunk and a final finish chunk), so reasoning and content deltas reach
+    the client as they are produced rather than in a single end-of-generation
+    burst."""
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    mname = model_name or state["model_name"] or "unknown"
 
-    def sse(chunk):
+    def sse(delta=None, finish=None):
         payload = _StreamChunk(
-            id=cid, created=created,
-            model=model_name or state["model_name"] or "unknown",
-            choices=[chunk],
+            id=cid, created=created, model=mname,
+            choices=[_StreamChoice(
+                index=0,
+                delta=delta if delta is not None else _StreamDelta(),
+                finish_reason=finish,
+            )],
         )
         return f"data: {payload.model_dump_json()}\n\n"
 
     def gen():
-        yield sse(_StreamChoice(index=0, delta=_StreamDelta(role="assistant")))
-        yield sse(_StreamChoice(
-            index=0,
-            delta=_StreamDelta(content=res["content"],
-                               reasoning_content=res["reasoning"]),
-        ))
-        yield sse(_StreamChoice(index=0, delta=_StreamDelta(),
-                                finish_reason=res["finish_reason"]))
+        yield sse(delta=_StreamDelta(role="assistant"))
+        for item in generate_stream(
+            state["model"], state["tokenizer"], messages,
+            max_tokens, temperature, top_p, top_k,
+        ):
+            if "reasoning_delta" in item:
+                rd, cd = item["reasoning_delta"], item["content_delta"]
+                if rd or cd:
+                    yield sse(_StreamDelta(
+                        content=cd or None,
+                        reasoning_content=rd or None,
+                    ))
+            else:
+                yield sse(finish=item["finish_reason"])
         yield "data: [DONE]\n\n"
 
     from fastapi.responses import StreamingResponse
