@@ -1,0 +1,23 @@
+[project]
+name = "ternary-bonsai-openai-server"
+version = "0.1.0"
+description = "OpenAI-compatible endpoint server for the Ternary-Bonsai-2-27B MLX (Qwen3.5) model, using the official Prism hadamard runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Official Prism runtime pins (see runtime/requirements.txt)
+    "mlx==0.32.0",
+    "mlx-lm==0.31.3",
+    "transformers==5.5.0",
+    "tokenizers>=0.21",
+    "jinja2>=3.1",
+    "numpy>=2.0",
+    # OpenAI-compatible HTTP server
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+]
+
+[tool.uv]
+# Scripts-only directory: do not build/install the project itself.
+package = false
