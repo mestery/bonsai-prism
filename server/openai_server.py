@@ -6,9 +6,8 @@ local LM Studio model pack with the official Prism hadamard runtime and
 generating with MLX.
 
 Usage:
-    uv run openai_server.py
     uv run openai_server.py --model /path/to/Ternary-Bonsai-2-27B-mlx-2bit
-    uv run openai_server.py --port 8270 --host 127.0.0.1
+    uv run openai_server.py --model /path/to/... --port 8270 --host 127.0.0.1
 """
 
 from __future__ import annotations
@@ -35,10 +34,6 @@ from runtime.runtime import Packed
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
-DEFAULT_MODEL_DIR = str(
-    Path.home() / ".lmstudio" / "models" / "prism-ml" / "Ternary-Bonsai-2-27B-mlx-2bit"
-)
 
 DEFAULT_PORT = 8270
 DEFAULT_HOST = "127.0.0.1"
@@ -330,12 +325,14 @@ class _StreamChunk(BaseModel):
 
 app = FastAPI(title="Ternary-Bonsai OpenAI Server")
 
-state: Dict[str, Any] = {"model": None, "tokenizer": None, "model_name": None}
+state: Dict[str, Any] = {
+    "model_dir": None, "model": None, "tokenizer": None, "model_name": None
+}
 
 
 @app.on_event("startup")
 def _startup():
-    model_dir = DEFAULT_MODEL_DIR
+    model_dir = state["model_dir"]
     print(f"loading model from {model_dir} ...")
     t0 = time.time()
     model, tokenizer = load_model(model_dir)
@@ -443,15 +440,14 @@ def _stream(messages, max_tokens, temperature, top_p, top_k, model_name):
 # ---------------------------------------------------------------------------
 
 def main():
-    global DEFAULT_MODEL_DIR
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default=DEFAULT_MODEL_DIR,
+    ap.add_argument("--model", required=True,
                     help="path to the model pack directory")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default=DEFAULT_HOST)
     args = ap.parse_args()
 
-    DEFAULT_MODEL_DIR = args.model
+    state["model_dir"] = args.model
 
     print(f"serving on http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

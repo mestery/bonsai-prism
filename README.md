@@ -20,8 +20,8 @@ See [`server/`](server/README.md) for full details. In short:
 
 ```bash
 cd server
-uv sync                 # installs the pinned deps into server/.venv
-uv run openai_server.py # serves on http://127.0.0.1:8270
+uv sync                                                        # installs the pinned deps into server/.venv
+uv run openai_server.py --model /path/to/Ternary-Bonsai-2-27B-mlx-2bit
 ```
 
 Then:

@@ -32,23 +32,24 @@ This creates a `.venv/` with the exact pinned runtime
 
 ## Run
 
+The model pack path is a required option:
+
 ```bash
 cd server
-uv run openai_server.py
+uv run openai_server.py --model /path/to/Ternary-Bonsai-2-27B-mlx-2bit
 ```
 
-Useful flags:
+Optional flags:
 
 ```bash
-uv run openai_server.py --model /path/to/Ternary-Bonsai-2-27B-mlx-2bit
-uv run openai_server.py --port 8270 --host 127.0.0.1
+uv run openai_server.py --model /path/to/... --port 8270 --host 127.0.0.1
 ```
 
 The server binds to `127.0.0.1:8270` by default and reports progress on stdout:
 
 ```
 serving on http://127.0.0.1:8270
-loading model from ~/.lmstudio/models/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit ...
+loading model from /path/to/Ternary-Bonsai-2-27B-mlx-2bit ...
 model loaded in 3.0s
 ```
 
