@@ -1,0 +1,10 @@
+AGENTS.md
+.qwen/
+.claude/
+.aider*
+opencode.jsonc
+
+node_modules/
+dist/
+*.local
+.DS_Store
