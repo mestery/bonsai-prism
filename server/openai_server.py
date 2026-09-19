@@ -40,7 +40,13 @@ from runtime.runtime import Packed
 DEFAULT_PORT = 8270
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_MAX_NEW_TOKENS = 512
-MAX_CTX = 4096
+# OOM-safe context window. The model's full-attention uses head_dim 256, which
+# MLX's flash kernel (supported dims {32, 64, 128}) does not cover, so those
+# layers run the unfused O(S^2) attention. That makes memory grow quadratically
+# with the prompt, so the safe window is much smaller than the model's 262k
+# config. 8192 is comfortable on ~40 GB of Metal; raise to ~10k-12k at your own
+# risk of OOM.
+MAX_CTX = 8192
 
 # Built from pieces so the literal marker tokens never appear in this source.
 _THINK_CLOSE = "</" + "think" + ">"
@@ -332,8 +338,15 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
         messages, tokenize=False, add_generation_prompt=True, **tkwargs
     )
     input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    # Cap the prompt so prompt + completion stays within the OOM-safe window.
+    # Front-truncation drops the start of the conversation, so warn when it
+    # happens.
     if len(input_ids) > MAX_CTX:
+        print(f"[warn] prompt {len(input_ids)} tokens exceeds context window "
+              f"({MAX_CTX}); front-truncating to the last {MAX_CTX} tokens")
         input_ids = input_ids[-MAX_CTX:]
+    # Cap the completion so the total never exceeds the window.
+    max_tokens = min(max_tokens, max(0, MAX_CTX - len(input_ids)))
 
     eos = tokenizer.eos_token_id
     cache = model.make_cache()
@@ -668,8 +681,12 @@ def main():
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--max-ctx", type=int, default=MAX_CTX,
-                    help="max prompt context in tokens; longer prompts are "
-                         "front-truncated (default %(default)s)")
+                    help="OOM-safe context window in tokens (prompt + "
+                         "completion). Longer prompts are front-truncated and "
+                         "the completion is capped to fit. The model's "
+                         "head_dim-256 attention is O(S^2), so keep this modest "
+                         "(8192 default; ~10k-12k at your own OOM risk) "
+                         "(default %(default)s)")
     args = ap.parse_args()
 
     state["model_dir"] = args.model
