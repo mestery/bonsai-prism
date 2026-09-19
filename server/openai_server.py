@@ -48,6 +48,12 @@ DEFAULT_MAX_NEW_TOKENS = 512
 # risk of OOM.
 MAX_CTX = 8192
 
+# Throughput logging (--log-tokens-per-sec): when enabled, print decode
+# tokens/sec periodically during generation plus a final prefill/decode
+# summary. Off by default.
+LOG_TPS = False
+LOG_TPS_PERIOD = 1.0  # seconds between periodic prints
+
 # Built from pieces so the literal marker tokens never appear in this source.
 _THINK_CLOSE = "</" + "think" + ">"
 
@@ -354,9 +360,19 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
     cache = model.make_cache()
 
     x = mx.array([input_ids])
+    t0 = time.time()
     logits = _step_logits(model, x, cache)
+    if LOG_TPS:
+        mx.eval(logits)  # force prefill compute so its cost is timed here
+    prefill_s = time.time() - t0
     ids = list(input_ids)
     finish = "stop"
+
+    # Decode-throughput tracking for --log-tokens-per-sec.
+    n_gen = 0
+    t_decode_start = time.time()
+    t_win = t_decode_start
+    tok_win = 0
 
     close_id = tokenizer.convert_tokens_to_ids(_THINK_CLOSE)
     in_reasoning = True
@@ -370,6 +386,7 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
     for _ in range(max_tokens):
         nxt = sample(logits, temperature, top_p, top_k)
         ids.append(nxt)
+        n_gen += 1
 
         if in_reasoning and nxt == close_id:
             in_reasoning = False      # separator token dropped
@@ -399,6 +416,16 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
             finish = "stop"
             break
         logits = _step_logits(model, mx.array([[nxt]]), cache)
+
+        if LOG_TPS:
+            mx.eval(logits)  # charge this step's compute to its wall time
+            now = time.time()
+            if now - t_win >= LOG_TPS_PERIOD:
+                span = now - t_win
+                print(f"[tps] {(n_gen - tok_win) / span:.2f} tok/s "
+                      f"(gen {n_gen}/{max_tokens})")
+                t_win = now
+                tok_win = n_gen
     else:
         finish = "length"
 
@@ -408,6 +435,13 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
     else:
         tool_calls, residual = None, raw_content
     shown = residual if tool_calls else raw_content
+    if LOG_TPS:
+        t_dec = time.time() - t_decode_start
+        pps = len(input_ids) / prefill_s if prefill_s > 0 else 0.0
+        dps = n_gen / t_dec if t_dec > 0 else 0.0
+        print(f"[tps] prefill {len(input_ids)} tok in {prefill_s:.2f}s "
+              f"({pps:.1f} tok/s) | decode {n_gen} tok in {t_dec:.2f}s "
+              f"({dps:.2f} tok/s)")
     yield {
         "reasoning": reasoning_text.strip() or None,
         "content": shown.strip(),
@@ -676,12 +710,16 @@ def _stream(messages, max_tokens, temperature, top_p, top_k, model_name,
 # ---------------------------------------------------------------------------
 
 def main():
-    global MAX_CTX
+    global MAX_CTX, LOG_TPS
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
                     help="path to the model pack directory")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--host", default=DEFAULT_HOST)
+    ap.add_argument("--log-tokens-per-sec", action="store_true",
+                    help="periodically print decode tokens/sec to the server "
+                         "log, plus a final prefill/decode summary "
+                         "(disabled by default)")
     ap.add_argument("--max-ctx", type=int, default=MAX_CTX,
                     help="OOM-safe context window in tokens (prompt + "
                          "completion). The prompt is front-truncated to reserve "
@@ -693,8 +731,10 @@ def main():
 
     state["model_dir"] = args.model
     MAX_CTX = args.max_ctx
+    LOG_TPS = args.log_tokens_per_sec
 
-    print(f"serving on http://{args.host}:{args.port} (max_ctx={MAX_CTX})")
+    print(f"serving on http://{args.host}:{args.port} (max_ctx={MAX_CTX}"
+          f"{', tps logging on' if LOG_TPS else ''})")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
