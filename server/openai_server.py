@@ -344,17 +344,21 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
         messages, tokenize=False, add_generation_prompt=True, **tkwargs
     )
     input_ids = tokenizer.encode(prompt, add_special_tokens=False)
-    # Keep prompt + completion within the OOM-safe window. Reserve the requested
-    # completion budget and front-truncate the prompt to fit (front-truncation
-    # drops the start of the conversation, so warn when it happens). Clamping
+    # Keep prompt + completion within the OOM-safe window. The prompt is the
+    # user's actual content: a prompt that FITS the window is kept intact and
+    # only the completion budget is capped to whatever is left. A prompt that
+    # alone EXCEEDS the window is front-truncated to reserve the (capped)
+    # completion; that drops the start of the conversation, so warn. Clamping
     # max_tokens to MAX_CTX-1 always leaves room for at least one prompt token.
-    max_tokens = max(1, min(max_tokens, MAX_CTX - 1))
-    room = MAX_CTX - max_tokens
-    if len(input_ids) > room:
+    if len(input_ids) > MAX_CTX:
+        max_tokens = max(1, min(max_tokens, MAX_CTX - 1))
+        room = MAX_CTX - max_tokens
         print(f"[warn] prompt {len(input_ids)} tokens exceeds the context window "
               f"({MAX_CTX}); front-truncating to the last {room} tokens to leave "
               f"room for {max_tokens} completion tokens")
         input_ids = input_ids[-room:]
+    else:
+        max_tokens = min(max_tokens, max(0, MAX_CTX - len(input_ids)))
 
     eos = tokenizer.eos_token_id
     cache = model.make_cache()
