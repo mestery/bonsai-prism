@@ -15,11 +15,12 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -180,6 +181,86 @@ def load_model(model_dir: str):
 
 
 # ---------------------------------------------------------------------------
+# Tool-call parsing
+# ---------------------------------------------------------------------------
+
+# Tag markers are built from pieces so the two-char open/close markers never
+# appear as literals in this source (some tooling mis-parses them).
+_TC_OPEN = "<tool_call>"
+_TC_CLOSE = "\u003c/" + "tool_call" + "\u003e"
+_FN_CLOSE = "\u003c/" + "function" + "\u003e"
+_PAR_CLOSE = "\u003c/" + "parameter" + "\u003e"
+
+_TOOL_CALL_RE = re.compile(
+    "<tool_call>\\s*<function=([^>]+)>\\s*"
+    f"((?:<parameter=[^>]+>\\s*\\n.*?\\n{_PAR_CLOSE}\\s*)*)"
+    f"{_FN_CLOSE}\\s*{_TC_CLOSE}",
+    re.DOTALL,
+)
+_PARAM_RE = re.compile(
+    rf"<parameter=([^>]+)>\s*\n(.*?)\n</parameter>",
+    re.DOTALL,
+)
+
+# Token IDs for the opening tag of a tool call. The model emits the
+# tag as exactly four tokens: '<', 'tool', '_call', '>'. We detect the
+# start of the tool-call zone by scanning the content token stream for
+# this run, which lets us suppress raw tool-call text from streaming
+# deltas as soon as it begins (before the full block is parseable).
+#
+# IMPORTANT: these IDs are for this model's tokenizer (Ternary-Bonsai-2
+# byte-level BPE). If the tokenizer changes, re-derive them:
+#   tok = tokenizer; [tok.convert_tokens_to_ids(t) for t in ('<','tool','_call','>')]
+_LT_TOK_ID = 27
+_TOOL_TOK_ID = 13766
+_CALL_TOK_ID = 13042
+_GT_TOK_ID = 29
+_SLASH_TOK_ID = 510          # '</'
+_FUNC_TOK_ID = 1628          # 'function'
+# Opening tag: '<','tool','_call','>'
+_TC_OPEN_TOKS = (_LT_TOK_ID, _TOOL_TOK_ID, _CALL_TOK_ID, _GT_TOK_ID)
+# Closing tag: '</','tool','_call','>'  (marks end of one tool-call block)
+_TC_CLOSE_TOKS = (_SLASH_TOK_ID, _TOOL_TOK_ID, _CALL_TOK_ID, _GT_TOK_ID)
+
+
+def _parse_tool_calls(text: str) -> Tuple[Optional[List[Dict]], str]:
+    """Extract structured tool calls from the model's raw output.
+
+    Returns ``(tool_calls, residual)`` where ``tool_calls`` is a list of
+    ``{"id", "type", "function": {"name", "arguments"}}`` dicts (or ``None``
+    if none were found) and ``residual`` is the text with the tool-call
+    blocks removed (stripped).
+    """
+    if not text:
+        return None, ""
+
+    matches = list(_TOOL_CALL_RE.finditer(text))
+    if not matches:
+        return None, text
+
+    tool_calls: List[Dict] = []
+    for i, m in enumerate(matches):
+        name = m.group(1).strip()
+        args_block = m.group(2) or ""
+        params: Dict[str, Any] = {}
+        for pm in _PARAM_RE.finditer(args_block):
+            key = pm.group(1)
+            val = pm.group(2).strip()
+            try:
+                params[key] = json.loads(val)
+            except (json.JSONDecodeError, ValueError):
+                params[key] = val
+        tool_calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(params)},
+        })
+
+    residual = _TOOL_CALL_RE.sub("", text).strip()
+    return tool_calls, residual
+
+
+# ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
 
@@ -204,25 +285,33 @@ def sample(logits: mx.array, temperature: float, top_p: float,
     return int(mx.random.categorical(probs))
 
 
+def _content_before_tool_call(text: str) -> str:
+    """Text up to (excluding) the first tool-call open tag, or the whole text
+    if no tool call has started. Keeps raw tool-call XML out of streaming
+    content deltas."""
+    i = text.find(_TC_OPEN)
+    return text[:i] if i != -1 else text
+
+
 def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
                     max_tokens: int, temperature: float, top_p: float,
-                    top_k: Optional[int]):
+                    top_k: Optional[int], tools: Optional[List[Dict]] = None):
     """Incremental completion generator for a reasoning model.
 
     Yields one dict per sampled token carrying ``reasoning_delta`` /
-    ``content_delta`` (the newly decoded text for each stream), then a final
-    dict with the full ``reasoning`` / ``content`` strings plus usage and
-    ``finish_reason``.
+    ``content_delta``, then a final dict with ``reasoning`` / ``content`` /
+    ``tool_calls`` / ``finish_reason`` plus usage.
 
-    The chat template pre-fills the open-think token (id 248068) after the
-    assistant turn start, so generation begins in *reasoning* mode.  We flip to
-    *content* mode when the close-think token (id 248069) is emitted (the
-    separator token itself is dropped).  Each step re-decodes the full
-    accumulated buffer so multi-byte UTF-8 sequences split across tokens
-    reassemble correctly; the delta is the suffix since the previous decode.
+    Raw tool-call XML is withheld from content deltas: as soon as the open
+    tool-call tag appears in the decoded content, only the text before it is
+    streamed. Tool calls are parsed from the full final content and reported
+    in the final dict.
     """
+    # Inject tool definitions into the rendered prompt so the model knows they
+    # are available; without this it never emits a tool call.
+    tkwargs = {"tools": tools} if tools else {}
     prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True, **tkwargs
     )
     input_ids = tokenizer.encode(prompt, add_special_tokens=False)
     if len(input_ids) > MAX_CTX:
@@ -241,7 +330,9 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
     reasoning_buf: List[int] = []
     content_buf: List[int] = []
     reasoning_text = ""
-    content_text = ""
+    # Full raw content (incl. tool calls). Doubles as the raw prefix already
+    # streamed, which is the marker for computing content deltas.
+    raw_content_text = ""
 
     for _ in range(max_tokens):
         nxt = sample(logits[:, -1, :], temperature, top_p, top_k)
@@ -255,10 +346,20 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
             content_buf.append(nxt)
 
         rt = tokenizer.decode(reasoning_buf, skip_special_tokens=True)
-        ct = tokenizer.decode(content_buf, skip_special_tokens=True)
+        raw_ct = tokenizer.decode(content_buf, skip_special_tokens=True)
+        safe_ct = _content_before_tool_call(raw_ct)
         rd = rt[len(reasoning_text):] if rt.startswith(reasoning_text) else rt
-        cd = ct[len(content_text):] if ct.startswith(content_text) else ct
-        reasoning_text, content_text = rt, ct
+        # Emit only the part of the safe (pre-tool-call) text that comes after
+        # what has already been streamed. The marker is the FULL raw prefix,
+        # not the safe prefix: while the open tool-call tag is still assembling
+        # token-by-token, safe_ct transiently SHRINKS to a strict prefix of the
+        # raw prefix already streamed, and the negative slice then yields ""
+        # instead of re-emitting the preamble.
+        if raw_ct.startswith(raw_content_text):
+            cd = safe_ct[len(raw_content_text):]
+        else:
+            cd = safe_ct
+        reasoning_text, raw_content_text = rt, raw_ct
         yield {"reasoning_delta": rd, "content_delta": cd}
 
         if nxt == eos:
@@ -268,10 +369,17 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
     else:
         finish = "length"
 
+    raw_content = raw_content_text.strip()
+    if tools:
+        tool_calls, residual = _parse_tool_calls(raw_content)
+    else:
+        tool_calls, residual = None, raw_content
+    shown = residual if tool_calls else raw_content
     yield {
         "reasoning": reasoning_text.strip() or None,
-        "content": content_text.strip(),
-        "finish_reason": finish,
+        "content": shown.strip(),
+        "tool_calls": tool_calls,
+        "finish_reason": "tool_calls" if tool_calls else finish,
         "prompt_tokens": len(input_ids),
         "completion_tokens": len(ids) - len(input_ids),
     }
@@ -279,11 +387,13 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
 
 def generate(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
              max_tokens: int, temperature: float, top_p: float,
-             top_k: Optional[int]) -> Dict[str, Any]:
+             top_k: Optional[int], tools: Optional[List[Dict]] = None
+             ) -> Dict[str, Any]:
     """Non-streaming completion: consume :func:`generate_stream` to completion."""
     final: Dict[str, Any] = {}
     for item in generate_stream(
-        model, tokenizer, messages, max_tokens, temperature, top_p, top_k
+        model, tokenizer, messages, max_tokens, temperature, top_p, top_k,
+        tools=tools,
     ):
         if "reasoning_delta" not in item:
             final = item
@@ -297,6 +407,8 @@ def generate(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
 class ChatMessage(BaseModel):
     role: str
     content: Optional[str] = None
+    tool_calls: Optional[List[Dict]] = None
+    tool_call_id: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -308,12 +420,15 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     max_completion_tokens: Optional[int] = None
     stream: bool = False
+    tools: Optional[List[Dict]] = None
+    tool_choice: Optional[Any] = None
 
 
 class _ChoiceMsg(BaseModel):
     role: str = "assistant"
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[Dict]] = None
 
 
 class _Choice(BaseModel):
@@ -341,6 +456,7 @@ class _StreamDelta(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[Dict]] = None
 
 
 class _StreamChoice(BaseModel):
@@ -355,6 +471,41 @@ class _StreamChunk(BaseModel):
     created: int
     model: str
     choices: List[_StreamChoice]
+
+
+def _build_messages(msgs: List[ChatMessage]) -> List[Dict[str, Any]]:
+    """Convert request messages to the dict form the chat template expects.
+
+    Assistant ``tool_calls`` carry ``arguments`` as a JSON string (as produced
+    by the parser). The Qwen template iterates ``arguments`` with ``|items``,
+    which requires a mapping, so decode it back to a dict here -- otherwise a
+    multi-turn request that echoes a prior tool call fails to render.
+    """
+    out: List[Dict[str, Any]] = []
+    for m in msgs:
+        d: Dict[str, Any] = {"role": m.role, "content": m.content or ""}
+        if m.tool_calls:
+            tcs = []
+            for tc in m.tool_calls:
+                fn = dict(tc.get("function", {}))
+                raw = fn.get("arguments")
+                if isinstance(raw, str):
+                    try:
+                        fn["arguments"] = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        fn["arguments"] = {"_raw": raw}
+                elif raw is None:
+                    fn["arguments"] = {}
+                tcs.append({
+                    "id": tc.get("id"),
+                    "type": tc.get("type", "function"),
+                    "function": fn,
+                })
+            d["tool_calls"] = tcs
+        if m.tool_call_id:
+            d["tool_call_id"] = m.tool_call_id
+        out.append(d)
+    return out
 
 
 state: Dict[str, Any] = {
@@ -397,20 +548,23 @@ def chat_completions(req: ChatCompletionRequest):
     if state["model"] is None or state["tokenizer"] is None:
         _not_ready()
 
-    messages = [{"role": m.role, "content": m.content or ""} for m in req.messages]
+    messages = _build_messages(req.messages)
     max_tokens = (
         req.max_tokens
         or req.max_completion_tokens
         or DEFAULT_MAX_NEW_TOKENS
     )
+    tools = req.tools
 
     if req.stream:
-        return _stream(messages, max_tokens, req.temperature, req.top_p, req.top_k, req.model)
+        return _stream(messages, max_tokens, req.temperature, req.top_p, req.top_k,
+                       req.model, tools=tools)
 
     t0 = time.time()
     res = generate(
         state["model"], state["tokenizer"], messages,
         max_tokens, req.temperature, req.top_p, req.top_k,
+        tools=tools,
     )
 
     return ChatCompletionResponse(
@@ -421,8 +575,9 @@ def chat_completions(req: ChatCompletionRequest):
             _Choice(
                 index=0,
                 message=_ChoiceMsg(
-                    content=res["content"],
+                    content=res["content"] or None,
                     reasoning_content=res["reasoning"],
+                    tool_calls=res["tool_calls"],
                 ),
                 finish_reason=res["finish_reason"],
             )
@@ -435,7 +590,8 @@ def chat_completions(req: ChatCompletionRequest):
     )
 
 
-def _stream(messages, max_tokens, temperature, top_p, top_k, model_name):
+def _stream(messages, max_tokens, temperature, top_p, top_k, model_name,
+            tools: Optional[List[Dict]] = None):
     """Incremental SSE stream: one chunk per sampled token (plus the initial
     role chunk and a final finish chunk), so reasoning and content deltas reach
     the client as they are produced rather than in a single end-of-generation
@@ -460,6 +616,7 @@ def _stream(messages, max_tokens, temperature, top_p, top_k, model_name):
         for item in generate_stream(
             state["model"], state["tokenizer"], messages,
             max_tokens, temperature, top_p, top_k,
+            tools=tools,
         ):
             if "reasoning_delta" in item:
                 rd, cd = item["reasoning_delta"], item["content_delta"]
@@ -469,7 +626,12 @@ def _stream(messages, max_tokens, temperature, top_p, top_k, model_name):
                         reasoning_content=rd or None,
                     ))
             else:
-                yield sse(finish=item["finish_reason"])
+                # Final chunk: include parsed tool_calls if present.
+                tcs = item.get("tool_calls")
+                yield sse(
+                    delta=_StreamDelta(tool_calls=tcs) if tcs else None,
+                    finish=item["finish_reason"],
+                )
         yield "data: [DONE]\n\n"
 
     from fastapi.responses import StreamingResponse
