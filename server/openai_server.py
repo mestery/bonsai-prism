@@ -338,15 +338,17 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
         messages, tokenize=False, add_generation_prompt=True, **tkwargs
     )
     input_ids = tokenizer.encode(prompt, add_special_tokens=False)
-    # Cap the prompt so prompt + completion stays within the OOM-safe window.
-    # Front-truncation drops the start of the conversation, so warn when it
-    # happens.
-    if len(input_ids) > MAX_CTX:
-        print(f"[warn] prompt {len(input_ids)} tokens exceeds context window "
-              f"({MAX_CTX}); front-truncating to the last {MAX_CTX} tokens")
-        input_ids = input_ids[-MAX_CTX:]
-    # Cap the completion so the total never exceeds the window.
-    max_tokens = min(max_tokens, max(0, MAX_CTX - len(input_ids)))
+    # Keep prompt + completion within the OOM-safe window. Reserve the requested
+    # completion budget and front-truncate the prompt to fit (front-truncation
+    # drops the start of the conversation, so warn when it happens). Clamping
+    # max_tokens to MAX_CTX-1 always leaves room for at least one prompt token.
+    max_tokens = max(1, min(max_tokens, MAX_CTX - 1))
+    room = MAX_CTX - max_tokens
+    if len(input_ids) > room:
+        print(f"[warn] prompt {len(input_ids)} tokens exceeds the context window "
+              f"({MAX_CTX}); front-truncating to the last {room} tokens to leave "
+              f"room for {max_tokens} completion tokens")
+        input_ids = input_ids[-room:]
 
     eos = tokenizer.eos_token_id
     cache = model.make_cache()
@@ -682,8 +684,8 @@ def main():
     ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--max-ctx", type=int, default=MAX_CTX,
                     help="OOM-safe context window in tokens (prompt + "
-                         "completion). Longer prompts are front-truncated and "
-                         "the completion is capped to fit. The model's "
+                         "completion). The prompt is front-truncated to reserve "
+                         "room for the requested completion. The model's "
                          "head_dim-256 attention is O(S^2), so keep this modest "
                          "(8192 default; ~10k-12k at your own OOM risk) "
                          "(default %(default)s)")
