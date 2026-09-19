@@ -18,7 +18,7 @@ import json
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -124,6 +124,44 @@ def _count_packed(model) -> int:
     return total
 
 
+# Substrings of the two transformers warnings that fire when loading the
+# tokenizer for this custom ``prism_hadamard_qwen35`` model. Both are
+# known-benign here: (1) the config's custom ``model_type`` is not a
+# transformers-registered type, but we only need the tokenizer -- the model
+# weights are loaded separately via MLX; (2) the mistral-regex heuristic is a
+# false positive for this Qwen-family tokenizer (config.json carries no
+# ``transformers_version``). We do NOT apply the mistral "fix"
+# (``fix_mistral_regex=True``): it rewrites the pre-tokenizer regex and would
+# change tokenization. ``fix_mistral_regex=False`` plus this filter silence
+# both without altering the loaded tokenizer.
+_BENIGN_TRANSFORMERS_MARKERS = (
+    "to instantiate a model of type",
+    "incorrect regex pattern",
+)
+
+
+@contextmanager
+def _quiet_known_transformers_warnings():
+    """Temporarily drop the known-benign transformers warnings above."""
+    import logging
+
+    flt = logging.Filter()
+    flt.filter = lambda r: not any(
+        m in r.getMessage() for m in _BENIGN_TRANSFORMERS_MARKERS
+    )
+    lg = logging.getLogger("transformers")
+    lg.addFilter(flt)
+    handlers = list(lg.handlers)
+    for h in handlers:
+        h.addFilter(flt)
+    try:
+        yield
+    finally:
+        lg.removeFilter(flt)
+        for h in handlers:
+            h.removeFilter(flt)
+
+
 def load_model(model_dir: str):
     """Load the (text-only) model from an LM Studio pack directory.
 
@@ -187,7 +225,10 @@ def load_model(model_dir: str):
     packed_count = _count_packed(model)
     print(f"model ready: {packed_count} packed (ternary) modules")
 
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    with _quiet_known_transformers_warnings():
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(model_dir), fix_mistral_regex=False
+        )
     gc.collect()
     return model, tokenizer
 
