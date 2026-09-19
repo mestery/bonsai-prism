@@ -293,6 +293,24 @@ def _content_before_tool_call(text: str) -> str:
     return text[:i] if i != -1 else text
 
 
+def _step_logits(model: nn.Module, x: mx.array, cache) -> mx.array:
+    """Run one forward pass and return ONLY the final position's logits
+    (shape (1, V)).
+
+    Calling ``model(x, cache)`` applies ``lm_head`` to every prompt position,
+    producing a ``(1, seq_len, V)`` tensor. For a long prompt (e.g. ~47k
+    tokens, V=248320) that is ~43 GB and exceeds the Metal buffer limit, even
+    though we only need the last row. Splitting the step (as
+    ``runtime/artifact.py`` does): run the transformer for the hidden states,
+    then project just the last hidden vector through ``lm_head``.
+    """
+    hidden = model.model(x, cache=cache)
+    h = hidden[:, -1, :]
+    if model.args.tie_word_embeddings:
+        return model.model.embed_tokens.as_linear(h)
+    return model.lm_head(h)
+
+
 def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
                     max_tokens: int, temperature: float, top_p: float,
                     top_k: Optional[int], tools: Optional[List[Dict]] = None):
@@ -321,7 +339,7 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
     cache = model.make_cache()
 
     x = mx.array([input_ids])
-    logits = model(x, cache=cache)
+    logits = _step_logits(model, x, cache)
     ids = list(input_ids)
     finish = "stop"
 
@@ -335,7 +353,7 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
     raw_content_text = ""
 
     for _ in range(max_tokens):
-        nxt = sample(logits[:, -1, :], temperature, top_p, top_k)
+        nxt = sample(logits, temperature, top_p, top_k)
         ids.append(nxt)
 
         if in_reasoning and nxt == close_id:
@@ -365,7 +383,7 @@ def generate_stream(model: nn.Module, tokenizer, messages: List[Dict[str, str]],
         if nxt == eos:
             finish = "stop"
             break
-        logits = model(mx.array([[nxt]]), cache=cache)
+        logits = _step_logits(model, mx.array([[nxt]]), cache)
     else:
         finish = "length"
 
