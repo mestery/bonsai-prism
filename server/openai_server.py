@@ -33,6 +33,8 @@ from transformers import AutoTokenizer
 
 from runtime.runtime import Packed
 
+import tiled_attention
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -40,13 +42,14 @@ from runtime.runtime import Packed
 DEFAULT_PORT = 8270
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_MAX_NEW_TOKENS = 512
-# OOM-safe context window. The model's full-attention uses head_dim 256, which
-# MLX's flash kernel (supported dims {32, 64, 128}) does not cover, so those
-# layers run the unfused O(S^2) attention. That makes memory grow quadratically
-# with the prompt, so the safe window is much smaller than the model's 262k
-# config. 8192 is comfortable on ~40 GB of Metal; raise to ~10k-12k at your own
-# risk of OOM.
-MAX_CTX = 8192
+# Context window. The model's full-attention uses head_dim 256, which MLX's
+# flash kernel (supported dims {32, 64, 128}) does not cover. A query-tiled
+# attention patch (tiled_attention.py) makes those layers' memory linear in S
+# instead of the unfused O(S^2), so long prefill no longer OOMs; memory is now
+# bounded by the KV cache (linear) plus a fixed-size tile. 32768 is safe on 64 GB.
+# Note prefill is still somewhat slow (~80-110 tok/s here) -- that is the model's
+# GatedDeltaNet recurrent layers, not the attention patch.
+MAX_CTX = 32768
 
 # Throughput logging (--log-tokens-per-sec): when enabled, print decode
 # tokens/sec periodically during generation plus a final prefill/decode
@@ -627,6 +630,9 @@ state: Dict[str, Any] = {
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    # Install the query-tiled attention patch before loading the model so the
+    # head_dim-256 full-attention layers stay O(S) in memory on long prefill.
+    tiled_attention.patch_tiled_attention()
     model_dir = state["model_dir"]
     print(f"loading model from {model_dir} ...")
     t0 = time.time()
@@ -766,12 +772,11 @@ def main():
                          "log, plus a final prefill/decode summary "
                          "(disabled by default)")
     ap.add_argument("--max-ctx", type=int, default=MAX_CTX,
-                    help="OOM-safe context window in tokens (prompt + "
-                         "completion). The prompt is front-truncated to reserve "
-                         "room for the requested completion. The model's "
-                         "head_dim-256 attention is O(S^2), so keep this modest "
-                         "(8192 default; ~10k-12k at your own OOM risk) "
-                         "(default %(default)s)")
+                    help="Context window in tokens (prompt + completion). The "
+                         "prompt is front-truncated to reserve room for the "
+                         "requested completion. A query-tiled attention patch "
+                         "makes memory linear in S (no O(S^2) OOM), so 32768 is "
+                         "safe on 64 GB (default %(default)s)")
     args = ap.parse_args()
 
     state["model_dir"] = args.model

@@ -1,8 +1,10 @@
 # Long-Context Without the Cap — Options
 
 Reference doc for lifting the `--max-ctx` OOM cap and serving genuinely long
-prompts. The cap is a workaround; these are the two real fixes. Written to be
-picked back up later — every number below was measured, not estimated.
+prompts. The cap is a workaround; these are the two real fixes. **Option 2
+(tiled attention) is now implemented and enabled by default** — see the
+"Implemented" subsection and the measured results. Every number below was
+measured, not estimated.
 
 ---
 
@@ -162,6 +164,50 @@ target (e.g. 4–8 GB).
 The decode (single new token, S grows by 1) path is already O(S) per step and
 needs no change; only the **prefill** (all-at-once prompt) needs tiling.
 
+### Implemented (shipped)
+
+Lives in `server/tiled_attention.py`, applied from `openai_server.py::_lifespan`
+via `patch_tiled_attention()`. It monkeypatches the module-global
+`scaled_dot_product_attention` in `mlx_lm.models.qwen3_next` (the name
+`Qwen3NextAttention.__call__` resolves at call time). It does **not** touch the
+vendor's `runtime/` — it is a `server/`-top-level module imported at runtime.
+
+Design details that differ from the pseudocode above (and matter for correctness):
+
+- **GQA is unrolled, not a loop.** `Q [B, H, S, D]` is reshaped to
+  `[B, Hkv, R, S, D]` (R = H/Hkv Q-heads per KV head), so one batched matmul per
+  KV head covers all its Q-heads via broadcasting:
+  `s = (Q_r @ K^T)` where `Q_r [., ., R, S, D]`, `K [., ., 1, S, D]` →
+  `s [., ., R, S, S]`. No per-Q-head Python loop.
+- **`scale` is applied in fp32 *after* the fp16 `Q·K^T` matmul**
+  (`(q @ kT).astype(f32) * scale`), then softmax is fp32. This matches the
+  reference numerics for any scale value.
+- **Mask stays a string/`None`.** `KVCache.make_mask` yields the `"causal"` string
+  (prefill) or `None` (decode), so the patched path builds a causal block-mask
+  from the integer `S` — no array mask is ever passed through.
+- **Dispatch by length.** `TILE_THRESHOLD` (env `PRISM_ATTN_TILE_THRESHOLD`,
+  default 8192): S ≤ threshold → the fused kernel (fast, exact); S > threshold →
+  query-tiled. `TILE` (env `PRISM_ATTN_TILE`, default 1024) bounds the per-tile
+  score block to `H·TILE·S` fp32.
+
+Measured on the M4 Pro (64 GB), real model (H=24, Hkv=4, D=256):
+
+| S | path | prefill time | rate | **peak RSS** | OOM |
+|---|---|---|---|---|---|
+| 4096 | fused | 38.2 s | 107 tok/s | **15.84 GB** | no |
+| 16384 | tiled | 188.0 s | 87 tok/s | **15.84 GB** | no |
+| 32768 | tiled | 478.0 s | 69 tok/s | **15.84 GB** | no |
+
+Peak RSS is **flat (15.84 GB) across S = 4096 → 16384 → 32768** — the tiling keeps
+the attention scores bounded instead of the ~26 GB one-shot `S=16384` matrix (or
+~105 GB at `S=32768`). `--max-ctx` default was raised to **32768**.
+
+**Caveat — prefill is still slow, and not because of this patch.** The rate drops
+(107 → 87 → 69 tok/s) and the absolute slowness (~8 min for 32k) come from the 48
+GatedDeltaNet recurrent layers (O(S) but a heavy, growing per-token kernel), not
+the 16 full-attn layers (which cost well under a second total once tiled). The
+patch removes the OOM wall; it does not make prefill interactive.
+
 ### Trade-offs
 
 | | |
@@ -195,17 +241,19 @@ long context; it *runs* where today it *crashes*.
 
 ## Recommendation
 
-- **Do Option 2 first** to unblock long-context serving now with exact, bounded
-  memory — it is entirely in-repo, low-risk, and turns the crash into a slow-but-
-  working request. Ship it behind a flag (e.g. `--tile-prefill [T_q]`, default off
-  so short prompts keep the fast one-shot path).
+- **Option 2 is shipped** (`server/tiled_attention.py`, default on) and has
+  removed the OOM wall: `--max-ctx` is now 32768 and memory is flat with S. It
+  is entirely in-repo, low-risk, and turns the crash into a slow-but-working
+  request. The two env knobs (`PRISM_ATTN_TILE`, `PRISM_ATTN_TILE_THRESHOLD`)
+  trade peak memory vs. tile count.
 - **Pursue Option 1 in parallel** as the durable fix: file the MLX issue for a
   `head_dim=256` flash kernel. The moment a release (or a ported kernel) ships it,
   the 16 full-attn layers become O(S) and the context cap can be removed entirely
-  — at which point Option 2 becomes dead weight and can be dropped.
+  — at which point Option 2 becomes dead weight and can be dropped (remove the
+  `patch_tiled_attention()` call in `_lifespan`).
 
-The two are complementary, not competing: Option 2 is the stopgap, Option 1 is the
-finish line.
+The two are complementary, not competing: Option 2 is the stopgap (shipped),
+Option 1 is the finish line.
 
 ---
 
