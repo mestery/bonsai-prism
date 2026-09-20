@@ -5,8 +5,9 @@ description = "OpenAI-compatible endpoint server for the Ternary-Bonsai-2-27B ML
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    # Official Prism runtime pins (see runtime/requirements.txt)
-    "mlx==0.32.0",
+    # Local MLX fork (../mlx) provides the head_dim=256 dispatch fix; see
+    # [tool.uv.sources] below. The fork version satisfies mlx-lm's mlx>=0.31.2.
+    "mlx",
     "mlx-lm==0.31.3",
     "transformers==5.5.0",
     "tokenizers>=0.21",
@@ -21,3 +22,7 @@ dependencies = [
 [tool.uv]
 # Scripts-only directory: do not build/install the project itself.
 package = false
+
+[tool.uv.sources]
+# Build mlx from the local fork so `uv sync` installs the 256 fix (not PyPI).
+mlx = { path = "../mlx" }

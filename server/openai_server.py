@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import re
 import time
 import uuid
@@ -630,9 +631,15 @@ state: Dict[str, Any] = {
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Install the query-tiled attention patch before loading the model so the
-    # head_dim-256 full-attention layers stay O(S) in memory on long prefill.
-    tiled_attention.patch_tiled_attention()
+    # The head_dim-256 full-attention layers are now handled natively by the
+    # forked MLX fused flash kernel (O(S) memory, 1.3-1.8x faster than the
+    # unfused O(S^2) fallback). The query-tiled patch is kept only as an opt-in
+    # fallback (PRISM_TILE_ATTN=1) in case the native kernel is unavailable.
+    if os.environ.get("PRISM_TILE_ATTN", "0") == "1":
+        tiled_attention.patch_tiled_attention()
+        print("tiled attention patch enabled (PRISM_TILE_ATTN=1)")
+    else:
+        print("using native head-dim-256 flash kernel; tiled patch disabled")
     model_dir = state["model_dir"]
     print(f"loading model from {model_dir} ...")
     t0 = time.time()
