@@ -33,6 +33,7 @@ from safetensors import safe_open
 from transformers import AutoTokenizer
 
 from runtime.runtime import Packed
+from runtime.transform_dedup import apply as apply_transform_dedup
 
 import tiled_attention
 
@@ -644,6 +645,7 @@ async def _lifespan(app: FastAPI):
     print(f"loading model from {model_dir} ...")
     t0 = time.time()
     model, tokenizer = load_model(model_dir)
+    apply_transform_dedup()
     state["model"], state["tokenizer"] = model, tokenizer
     state["model_name"] = Path(model_dir).name
     mx.clear_cache()

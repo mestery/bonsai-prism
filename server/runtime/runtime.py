@@ -39,6 +39,24 @@ class Packed(nn.Module):
             dtype,
         )
 
+    def transform(self, x):
+        """Apply only the Hadamard transform (no GEMM)."""
+        if self.block:
+            return fwht(x, self.block, self.signs)
+        return x
+
+    def gemm(self, x):
+        """Apply only the quantized GEMM (no transform)."""
+        return mx.quantized_matmul(
+            x,
+            self.weight,
+            self.scales,
+            self.biases,
+            transpose=True,
+            group_size=128,
+            bits=2,
+        )
+
     def __call__(self, x):
         if self.embedding:
             shape = x.shape
@@ -57,17 +75,7 @@ class Packed(nn.Module):
             return (
                 fwht(out, self.block, self.signs, inverse=True) if self.block else out
             )
-        if self.block:
-            x = fwht(x, self.block, self.signs)
-        return mx.quantized_matmul(
-            x,
-            self.weight,
-            self.scales,
-            self.biases,
-            transpose=True,
-            group_size=128,
-            bits=2,
-        )
+        return self.gemm(self.transform(x))
 
 
 def load(gguf_path, gguf_python, dtype=mx.float16):
