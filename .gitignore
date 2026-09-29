@@ -9,5 +9,7 @@ dist/
 *.local
 .DS_Store
 
+server/_*.log
+
 # Local MLX checkout used for vendoring patches; never committed.
 mlx/
