@@ -11,6 +11,22 @@ It loads a local LM Studio model pack with the official Prism hadamard runtime
 
 - Python 3.10+ (this project pins `3.12` via [`.python-version`](.python-version)).
 - [`uv`](https://docs.astral.sh/uv/) to install dependencies and run.
+- **Forked MLX** — the standard PyPI `mlx` release does not support
+  `sdpa_head_dim=256`, which the Prism hadamard runtime requires. Build and
+  install from the fork before running `uv sync`:
+
+  ```bash
+  git clone https://github.com/mestery/mlx.git
+  cd mlx
+  git checkout 8ef88c055   # feat/sdpa-head-dim-256
+  pip install -e .
+  ```
+
+  (Requires a C++ compiler and CMake. On macOS, `brew install cmake` is enough.)
+
+  After this step, `import mlx.core` resolves to your local build. The `uv sync`
+  below will see the already-installed fork and skip the PyPI pin.
+
 - The model pack, present at the default location:
 
   ```
@@ -22,13 +38,16 @@ It loads a local LM Studio model pack with the official Prism hadamard runtime
 
 ## Install
 
+1. Build and install the forked MLX (see [Requirements](#requirements) above).
+2. Sync the rest of the runtime:
+
 ```bash
 cd server
 uv sync
 ```
 
 This creates a `.venv/` with the exact pinned runtime
-(`mlx==0.32.0`, `mlx-lm==0.31.3`, `transformers==5.5.0`, ...) and the web stack.
+(`mlx-lm==0.31.3`, `transformers==5.5.0`, ...) and the web stack.
 
 ## Run
 
