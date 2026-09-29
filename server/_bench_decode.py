@@ -1,8 +1,9 @@
 """Decode / prefill / per-layer benchmark for the 2-bit Bonsai-2 model.
 
 Run from the server venv (CLEAN GPU required - stop openai_server first):
-  .venv/bin/python _bench_decode.py
+  .venv/bin/python _bench_decode.py --model /path/to/model
 """
+import argparse
 import re
 import time
 from collections import defaultdict
@@ -12,8 +13,6 @@ import mlx.nn as nn
 
 import openai_server as S
 from runtime.runtime import Packed, fwht
-
-MODEL = "/Users/mestery/.lmstudio/models/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
 
 
 def collect_packed(model):
@@ -134,8 +133,13 @@ def bench_dense_split(model, make_prompt_ids):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True,
+                    help="path to the model pack directory")
+    args = ap.parse_args()
+
     print("device:", mx.default_device(), "| metal:", mx.metal.is_available())
-    model, tok = S.load_model(MODEL)
+    model, tok = S.load_model(args.model)
     mx.set_default_device(mx.gpu)
 
     layers = model.model.layers
